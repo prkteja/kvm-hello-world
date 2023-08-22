@@ -70,6 +70,8 @@ struct vm {
 	char *mem;
 };
 
+uint32_t exit_count = 0;
+
 void vm_init(struct vm *vm, size_t mem_size)
 {
 	int api_ver;
@@ -99,8 +101,8 @@ void vm_init(struct vm *vm, size_t mem_size)
 		exit(1);
 	}
 
-        if (ioctl(vm->fd, KVM_SET_TSS_ADDR, 0xfffbd000) < 0) {
-                perror("KVM_SET_TSS_ADDR");
+	if (ioctl(vm->fd, KVM_SET_TSS_ADDR, 0xfffbd000) < 0) {
+		perror("KVM_SET_TSS_ADDR");
 		exit(1);
 	}
 
@@ -118,9 +120,9 @@ void vm_init(struct vm *vm, size_t mem_size)
 	memreg.guest_phys_addr = 0;
 	memreg.memory_size = mem_size;
 	memreg.userspace_addr = (unsigned long)vm->mem;
-        if (ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &memreg) < 0) {
+	if (ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &memreg) < 0) {
 		perror("KVM_SET_USER_MEMORY_REGION");
-                exit(1);
+		exit(1);
 	}
 }
 
@@ -140,23 +142,34 @@ void vcpu_init(struct vm *vm, struct vcpu *vcpu)
 	}
 
 	vcpu_mmap_size = ioctl(vm->sys_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
-        if (vcpu_mmap_size <= 0) {
+	if (vcpu_mmap_size <= 0) {
 		perror("KVM_GET_VCPU_MMAP_SIZE");
-                exit(1);
+		exit(1);
 	}
-
+	// printf("vcpu mem size: %d\n", vcpu_mmap_size);
 	vcpu->kvm_run = mmap(NULL, vcpu_mmap_size, PROT_READ | PROT_WRITE,
 			     MAP_SHARED, vcpu->fd, 0);
+	// printf("vcpu hypervisor addr: %p\n", vcpu->kvm_run);
 	if (vcpu->kvm_run == MAP_FAILED) {
 		perror("mmap kvm_run");
 		exit(1);
 	}
 }
 
+struct file_t{
+	char* path;
+	int fd;
+	int flags;
+	int mode;
+	void* buf;
+	uint32_t size;
+};
+
 int run_vm(struct vm *vm, struct vcpu *vcpu, size_t sz)
 {
 	struct kvm_regs regs;
 	uint64_t memval = 0;
+	int fd = 0;
 
 	for (;;) {
 		if (ioctl(vcpu->fd, KVM_RUN, 0) < 0) {
@@ -167,19 +180,86 @@ int run_vm(struct vm *vm, struct vcpu *vcpu, size_t sz)
 		switch (vcpu->kvm_run->exit_reason) {
 		case KVM_EXIT_HLT:
 			goto check;
-
+		
 		case KVM_EXIT_IO:
-			if (vcpu->kvm_run->io.direction == KVM_EXIT_IO_OUT
-			    && vcpu->kvm_run->io.port == 0xE9) {
-				char *p = (char *)vcpu->kvm_run;
-				fwrite(p + vcpu->kvm_run->io.data_offset,
-				       vcpu->kvm_run->io.size, 1, stdout);
-				fflush(stdout);
+			exit_count++;
+			if (vcpu->kvm_run->io.direction == KVM_EXIT_IO_OUT){
+			    if(vcpu->kvm_run->io.port == 0xE9) {
+					char *p = (char *)vcpu->kvm_run;
+					fwrite(p + vcpu->kvm_run->io.data_offset,
+						vcpu->kvm_run->io.size, 1, stdout);
+					fflush(stdout);
+				}else if(vcpu->kvm_run->io.port == 0xEA) { //printval
+					uint32_t *p = (uint32_t *)vcpu->kvm_run;
+					int offset = vcpu->kvm_run->io.data_offset;
+					offset /= 4;
+					printf("%d\n", *(p+offset));
+				}else if(vcpu->kvm_run->io.port == 0xEC) { //display
+					uint32_t *p = (uint32_t *)vcpu->kvm_run;
+					int offset = vcpu->kvm_run->io.data_offset;
+					offset /= 4;
+					uint32_t addr = *(p+offset);
+					printf("%s\n", (char *)(&vm->mem[addr]));
+				}else if(vcpu->kvm_run->io.port == 0xED) { //open
+					uint32_t *p = (uint32_t *)vcpu->kvm_run;
+					int offset = vcpu->kvm_run->io.data_offset;
+					offset /= 4;
+					uint32_t addr = *(p+offset);
+					// printf("%p\n", addr);
+					struct file_t *file = (struct file_t *)(&vm->mem[addr]); 
+					char* path = (char *)(&vm->mem[(uintptr_t)file->path]);
+					fd = open(path, file->flags, file->mode);
+					// printf("opened %d\n", fd);
+					file->fd = fd;
+				}else if(vcpu->kvm_run->io.port == 0xEE){ //read
+					uint32_t *p = (uint32_t *)vcpu->kvm_run;
+					int offset = vcpu->kvm_run->io.data_offset;
+					offset /= 4;
+					uint32_t addr = *(p+offset);
+					struct file_t *file = (struct file_t *)(&vm->mem[addr]);  
+					int num_bytes = read(file->fd, &vm->mem[(uintptr_t)(file->buf)], file->size);
+					file->size = num_bytes;
+				}else if(vcpu->kvm_run->io.port == 0xEF){ //write
+					uint32_t *p = (uint32_t *)vcpu->kvm_run;
+					int offset = vcpu->kvm_run->io.data_offset;
+					offset /= 4;
+					uint32_t addr = *(p+offset);
+					struct file_t *file = (struct file_t *)(&vm->mem[addr]);
+					int num_bytes = write(file->fd, &vm->mem[(uintptr_t)(file->buf)], file->size);
+					file->size = num_bytes;
+				}else if(vcpu->kvm_run->io.port == 0xF0){ //close
+					uint32_t *p = (uint32_t *)vcpu->kvm_run;
+					int offset = vcpu->kvm_run->io.data_offset;
+					offset /= 4;
+					uint32_t addr = *(p+offset);
+					int *fd = (int *)(&vm->mem[addr]);
+					int ret = close(*fd);
+					*fd = ret;
+				}else if(vcpu->kvm_run->io.port == 0xF1){ //lseek
+					uint32_t *p = (uint32_t *)vcpu->kvm_run;
+					int offset = vcpu->kvm_run->io.data_offset;
+					offset /= 4;
+					uint32_t addr = *(p+offset);
+					int* args = (int *)(&vm->mem[addr]);
+					int ret = lseek(args[0], args[1], args[2]);
+					args[0] = ret;
+				};
+				continue;
+			}else if(vcpu->kvm_run->io.direction == KVM_EXIT_IO_IN){
+				if(vcpu->kvm_run->io.port == 0xEB) { //numexit
+					uint32_t *p = (uint32_t *)vcpu->kvm_run;
+					int offset = vcpu->kvm_run->io.data_offset;
+					offset /= 4;
+					p += offset;
+					*p = exit_count;
+				};
 				continue;
 			}
+		
 
 			/* fall through */
 		default:
+			exit_count++;
 			fprintf(stderr,	"Got exit_reason %d,"
 				" expected KVM_EXIT_HLT (%d)\n",
 				vcpu->kvm_run->exit_reason, KVM_EXIT_HLT);
@@ -200,8 +280,7 @@ int run_vm(struct vm *vm, struct vcpu *vcpu, size_t sz)
 
 	memcpy(&memval, &vm->mem[0x400], sz);
 	if (memval != 42) {
-		printf("Wrong result: memory at 0x400 is %lld\n",
-		       (unsigned long long)memval);
+		printf("Wrong result: memory at 0x400 is %lld\n", (unsigned long long)memval);
 		return 0;
 	}
 
@@ -493,3 +572,4 @@ int main(int argc, char **argv)
 
 	return 1;
 }
+
