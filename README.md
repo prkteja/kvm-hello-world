@@ -7,6 +7,10 @@ Intel processors with the VMX hardware virtualization extensions.  It
 *might* work on AMD processors with AMD-V, but that hasn't been
 tested.
 
+## Changes
+This fork contains new hypercalls for printing integers and strings, 
+getting number of guest exits and a bunch of filesystem operations.
+
 ## Background
 
 [KVM](https://en.wikipedia.org/wiki/Kernel-based_Virtual_Machine) is
